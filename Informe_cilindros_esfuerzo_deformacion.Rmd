@@ -1,0 +1,642 @@
+---
+title: "Análisis de curvas esfuerzo–deformación en cilindros de concreto"
+author: "Corresponding_Author J.Molina <juan.molina@ucacue.edu.ec>, P.Naspud <pilar.naspud@ucacue.edu.ec> "
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 5
+    toc_float: true
+    code_folding: hide
+    code_download: true
+  word_document:
+    toc: true
+    toc_depth: '5'
+  pdf_document:
+    latex_engine: xelatex
+    toc: true
+    toc_depth: '5'
+    number_sections: true
+---
+## White paper: Informe Técnico de deformación de cilindros
+### Autores:   Juan A. Molina[1], Pilar R. Naspud-Uruchima[1]
+### Filiación: [1] Universidad Católica de Cuenca
+### DOI:
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# Función auxiliar para instalar automáticamente un paquete
+pkg <- c(
+  "tidyverse", "janitor", "skimr", "lubridate", "GGally", "corrplot",
+  "caret", "randomForest", "rpart", "rpart.plot", "Metrics"
+)
+
+instalar <- pkg[!pkg %in% installed.packages()[,"Package"]]
+
+if(length(instalar) > 0){
+  install.packages(instalar, dependencies = TRUE)
+}
+
+# Cargar librerías
+library(tidyverse)
+library(janitor)
+library(skimr)
+library(lubridate)
+library(GGally)
+library(corrplot)
+library(caret)
+library(randomForest)
+library(rpart)
+library(rpart.plot)
+library(Metrics)
+
+# Configuración general de chunks
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# 1 Contexto de ingeniería
+
+En los ensayos de compresión de cilindros de concreto se evalúa el comportamiento mecánico del material mediante la obtención de la curva esfuerzo–deformación, la cual permite identificar parámetros fundamentales como la resistencia máxima, el módulo de elasticidad y el comportamiento post-pico del material.
+
+El esfuerzo ($\sigma$), expresado en MPa, se calcula como la relación entre la carga aplicada y el área transversal del espécimen. Por su parte, la deformación ($\varepsilon$) representa el cambio relativo de longitud del espécimen respecto a su longitud inicial.
+
+En la base de datos analizada, la deformación se registra inicialmente como desplazamiento medido en milímetros (mm). Para obtener la deformación unitaria es necesario normalizar estas lecturas respecto a la longitud de referencia del instrumento de medición. En este informe se analizan las curvas esfuerzo–deformación a partir de las deformaciones registradas experimentalmente, con el objetivo de caracterizar el comportamiento mecánico del concreto mediante técnicas de analítica de datos.
+
+**Objetivos del análisis:**
+
+1. Organizar y depurar la base de datos
+
+2. Graficar curvas esfuerzo–deformación por muestra y por grupo.
+
+3. Estimar propiedades mecánicas: resistencia a la compresión $f'_c$, deformación en el pico, tenacidad y módulo secante.
+
+4. Complementar con estadística descriptiva y comparaciones por grupos.
+
+# 2 Descripción de los datos
+
+El conjunto de datos corresponde a registros experimentales obtenidos durante ensayos de compresión de cilindros de concreto. Para cada espécimen se registran las siguientes variables:
+
+- Carga aplicada (kN)
+- Esfuerzo calculado (MPa)
+- Desplazamiento medido (mm)
+
+Estos datos permiten construir la curva esfuerzo–deformación y analizar el comportamiento mecánico del material durante el proceso de carga.
+
+# 3. Librerías
+
+```{r packages}
+pkgs <- c(
+  "readxl","dplyr","tidyr","stringr","purrr",
+  "ggplot2","scales","broom","patchwork",
+  "car","rstatix"
+)
+to_install <- pkgs[!pkgs %in% rownames(installed.packages())]
+if(length(to_install) > 0) install.packages(to_install, dependencies = TRUE)
+invisible(lapply(pkgs, library, character.only = TRUE))
+```
+
+# 4. Carga de datos (Excel)
+
+> Archivo esperado en el directorio del proyecto: `DATA_cilindros.xlsx`
+
+```{r read-excel}
+file_xlsx <- "DATA_cilindros.xlsx"
+
+sheets <- readxl::excel_sheets(file_xlsx)
+sheets
+```
+
+## 4.1. Lectura y transformación de datos
+
+Los datos experimentales fueron importados desde archivos en formato Excel, en los cuales cada hoja contiene pares de columnas correspondientes a deformación y esfuerzo para cada espécimen ensayado. Debido a que la estructura del archivo incluye columnas repetidas o vacías utilizadas como separadores, se implementó un procedimiento de procesamiento automatizado para identificar y extraer únicamente las columnas asociadas a cada espécimen.
+
+El algoritmo desarrollado detecta los nombres de los especímenes presentes en cada hoja y selecciona automáticamente el par de variables correspondiente a deformación y esfuerzo. Posteriormente, los datos son convertidos a formato numérico, se eliminan registros faltantes y se reorganiza la información en una estructura de datos en formato largo (long format), lo que permite facilitar su posterior análisis estadístico y visualización.
+
+Como resultado de este proceso se generó un conjunto de datos consolidado que contiene las variables hoja de origen (sheet), espécimen (specimen), deformación unitaria (strain) y esfuerzo (stress). Este procedimiento permitió estructurar un total de 43475 registros experimentales, garantizando la consistencia y trazabilidad de la información utilizada en las etapas posteriores del análisis.
+
+```{r tidy-function}
+read_sheet_curves <- function(sheet_name){
+
+  raw <- readxl::read_excel(file_xlsx, sheet = sheet_name, col_names = TRUE)
+
+  # Remover ("Strain/Stress" y unidades)
+  raw2 <- raw %>% dplyr::slice(-(1:2))
+
+  # Nombres de columnas como caracteres
+  cn <- names(raw2)
+
+  # Columnas "specimen" = NO empiezan con "Unnamed" y NO son tabla de picos
+  # Cada espécimen está en una columna y su esfuerzo en la columna contigua.
+  exclude <- c("Peaks","mm","MPa","Error%")
+  specimen_cols <- which(!(stringr::str_detect(cn, "^Unnamed")) & !(cn %in% exclude))
+
+  # Construir pares (strain_col = specimen, stress_col = siguiente)
+  pairs <- purrr::map_dfr(specimen_cols, function(i){
+    strain_col <- cn[i]
+    stress_col <- if(i + 1 <= length(cn)) cn[i+1] else NA_character_
+
+    # Si la columna contigua no parece esfuerzo (por ejemplo es otra "Strain" duplicada),
+    # se intentará usar la siguiente contigua adicional.
+    if(!is.na(stress_col) && stringr::str_detect(stress_col, "^Unnamed")){
+      # OK: en estos archivos la columna de esfuerzo suele ser Unnamed contigua
+      # (se valida por valores numéricos y rango más alto que la deformación)
+      # Aun así, si viniera duplicado, se corrige abajo por heurística.
+    }
+
+    df <- raw2 %>%
+      dplyr::transmute(
+        sheet = sheet_name,
+        specimen = strain_col,
+        strain_mm = suppressWarnings(as.numeric(.data[[strain_col]])),
+        stress_mpa = suppressWarnings(as.numeric(.data[[stress_col]]))
+      )
+
+    # Heurística: si "stress_mpa" es casi idéntica a strain_mm (columna duplicada),
+    # intentar desplazar una columna más
+    if(all(is.na(df$stress_mpa)) || stats::cor(df$strain_mm, df$stress_mpa, use="complete.obs") > 0.98){
+      if(i + 2 <= length(cn)){
+        stress_col2 <- cn[i+2]
+        df2 <- raw2 %>%
+          dplyr::transmute(
+            sheet = sheet_name,
+            specimen = strain_col,
+            strain_mm = suppressWarnings(as.numeric(.data[[strain_col]])),
+            stress_mpa = suppressWarnings(as.numeric(.data[[stress_col2]]))
+          )
+        # Aceptar si mejora
+        if(sum(!is.na(df2$stress_mpa)) > sum(!is.na(df$stress_mpa))){
+          df <- df2
+        }
+      }
+    }
+
+    df %>%
+      dplyr::filter(!is.na(strain_mm), !is.na(stress_mpa))
+  })
+
+  # Limpiar: asegurar no negativos (si existieran lecturas ruidosas)
+  pairs %>%
+    dplyr::filter(strain_mm >= 0, stress_mpa >= 0)
+}
+```
+
+```{r tidy-all}
+curves <- purrr::map_dfr(setdiff(sheets, "Elastic Modulus (Without Bars)"), read_sheet_curves)
+
+dplyr::glimpse(curves)
+dplyr::count(curves, sheet, specimen)
+```
+
+## 4.2. Cálculo de la deformación
+La deformación unitaria constituye uno de los parámetros fundamentales para la caracterización del comportamiento mecánico de materiales sometidos a carga. En ensayos de compresión en concreto, esta variable permite evaluar la respuesta del material frente a incrementos de esfuerzo y analizar la evolución de su comportamiento desde el rango elástico hasta el estado de falla.
+
+En el presente estudio, los valores de deformación unitaria fueron obtenidos a partir de los registros experimentales asociados a cada espécimen y posteriormente procesados mediante herramientas de analítica de datos. El análisis de esta variable permite identificar patrones en la respuesta mecánica del material, evaluar la variabilidad entre muestras y establecer relaciones con los niveles de esfuerzo alcanzados durante el ensayo.
+
+A partir de la visualización y análisis estadístico de los datos de deformación, es posible comprender con mayor claridad el comportamiento del concreto bajo compresión y apoyar la interpretación de las curvas esfuerzo–deformación obtenidas en los ensayos experimentales.
+
+Conocida la longitud inicial ($L_0$) en mm, la deformación unitaria es:
+$$
+\varepsilon = \frac{\Delta L}{L_0}
+$$
+
+```{r strain-conversion}
+L0_mm <- 200  # <-- longitu inicial (mm)
+
+if (!is.na(L0_mm) && is.finite(L0_mm) && L0_mm > 0) {
+  curves <- curves %>%
+    dplyr::mutate(
+      strain = strain_mm / L0_mm,
+      strain_unit = "mm/mm"
+    )
+} else {
+  curves <- curves %>%
+    dplyr::mutate(
+      strain = strain_mm,
+      strain_unit = "mm"
+    )
+}
+```
+
+# 5. Curvas esfuerzo–deformación
+
+## 5.1. Curvas por espécimen
+
+```{r plot-curves-individual}
+p_ind <- ggplot(curves, aes(x = strain, y = stress_mpa, group = specimen, color = specimen)) +
+  geom_line(linewidth = 0.7, alpha = 0.9) +
+  facet_wrap(~sheet, scales = "free_x") +
+  labs(
+    title = "Curvas esfuerzo–deformación por espécimen",
+    x = "Deformación (mm/mm)",
+    y = "Esfuerzo (MPa)",
+    color = "Espécimen"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+p_ind
+```
+
+
+El análisis de las curvas esfuerzo–deformación por espécimen evidencia un comportamiento mecánico consistente con la respuesta típica del concreto sometido a compresión uniaxial. En todos los grupos se identifica una fase inicial aproximadamente lineal correspondiente al régimen elástico, seguida por una región no lineal hasta alcanzar el esfuerzo máximo y una posterior rama descendente asociada al proceso de fisuración y pérdida de capacidad resistente. Los especímenes de los grupos C-B y C-R-B alcanzan valores máximos de esfuerzo cercanos a 25 MPa, mostrando una respuesta relativamente uniforme en la zona elástica, lo que sugiere una rigidez inicial comparable entre especímenes. Por su parte, los grupos CRF-B y CRF-R-B presentan valores de esfuerzo máximo ligeramente superiores, próximos a 28–30 MPa, además de una deformación al pico moderadamente mayor, lo que indica una mayor capacidad de deformación previa a la falla. Asimismo, se observa una mayor dispersión en la rama descendente de las curvas, particularmente en los grupos con refuerzo, lo cual sugiere diferencias en el mecanismo de propagación de fisuras y en la disipación de energía. En conjunto, los resultados indican que las configuraciones CRF presentan un comportamiento mecánico más favorable en términos de resistencia máxima y deformación última, mientras que los grupos C-B y C-R-B exhiben una respuesta más frágil caracterizada por una pérdida rápida de capacidad resistente después del pico.
+
+## 5.2. Curvas promedio
+
+El promedio se calcula sobre una malla común de deformación (interpolación lineal) para evitar que diferencias en la cantidad de puntos sesguen el resultado.
+
+```{r mean-curves}
+# Función: interpolación por espécimen a una grilla común
+interp_to_grid <- function(df, n = 300){
+  x <- df$strain
+  y <- df$stress_mpa
+  grid <- seq(min(x, na.rm=TRUE), max(x, na.rm=TRUE), length.out = n)
+  yhat <- approx(x, y, xout = grid, rule = 2)$y
+  tibble(strain = grid, stress_mpa = yhat)
+}
+
+mean_curves <- curves %>%
+  group_by(sheet, specimen) %>%
+  group_modify(~ interp_to_grid(.x)) %>%
+  ungroup() %>%
+  group_by(sheet, strain) %>%
+  summarise(
+    stress_mean = mean(stress_mpa, na.rm=TRUE),
+    stress_sd   = sd(stress_mpa, na.rm=TRUE),
+    .groups = "drop"
+  )
+
+p_mean <- ggplot(mean_curves, aes(x = strain, y = stress_mean)) +
+  geom_line(linewidth = 1) +
+  geom_ribbon(aes(ymin = pmax(0, stress_mean - stress_sd),
+                  ymax = stress_mean + stress_sd),
+              alpha = 0.2) +
+  facet_wrap(~sheet, scales = "free_x") +
+  labs(
+    title = "Curva promedio por grupo (media ± 1 DE)",
+    x = "Deformación (mm/mm)",
+    y = "Esfuerzo promedio (MPa)"
+  ) +
+  theme_minimal()
+p_mean
+```
+
+El análisis de las curvas promedio esfuerzo–deformación muestra un comportamiento consistente con la respuesta típica del concreto bajo compresión uniaxial, con una fase elástica inicial seguida de una región no lineal hasta alcanzar el esfuerzo máximo. Los grupos C-B y C-R-B presentan resistencias promedio cercanas a 25 MPa y una respuesta relativamente frágil después del pico. En contraste, los grupos CRF-B y CRF-R-B alcanzan esfuerzos máximos ligeramente mayores (≈28–30 MPa) y muestran una deformación al pico más elevada, lo que sugiere una mayor capacidad de deformación y mejor desempeño mecánico global.
+
+# 6. Propiedades mecánicas
+
+Se calculan propiedades de:
+
+- **Resistencia a compresión**: $f'_c = \max(\sigma)$.
+- **Deformación al pico**: $\varepsilon_{pico}$ (strain al máximo).
+- **Tenacidad**: área bajo la curva hasta el pico (integral numérica).
+- **Módulo secante (ASTM C469, aproximación 5%–45% de $f'_c$)**:  
+  $$E_s = \frac{\sigma_{45\%}-\sigma_{5\%}}{\varepsilon_{45\%}-\varepsilon_{5\%}}$$
+
+```{r specimen-metrics}
+# Integral por trapecios (base R)
+trapz <- function(x, y){
+  o <- order(x)
+  x <- x[o]; y <- y[o]
+  sum(diff(x) * (head(y,-1) + tail(y,-1)) / 2, na.rm = TRUE)
+}
+
+# Cálculo de propiedades por curva
+calc_metrics_one <- function(df){
+  df <- df %>% dplyr::arrange(strain)
+
+  # Si hay muy pocos puntos válidos, devolver NA
+  if(nrow(df) < 5) {
+    return(tibble(
+      fc_mpa = NA_real_,
+      strain_at_fc = NA_real_,
+      toughness_to_fc = NA_real_,
+      strain_5 = NA_real_,
+      strain_45 = NA_real_,
+      Es_MPa = NA_real_
+    ))
+  }
+
+  # Pico
+  fc <- max(df$stress_mpa, na.rm = TRUE)
+  idx_fc <- which.max(df$stress_mpa)[1]
+  eps_fc <- df$strain[idx_fc]
+
+  # Rama ascendente: hasta el pico
+  df_up <- df %>% dplyr::filter(strain <= eps_fc)
+
+  # Tenacidad hasta el pico
+  tough <- trapz(df_up$strain, df_up$stress_mpa)
+
+  # Módulo secante 5%–45% de f'c sobre rama ascendente
+  s5  <- 0.05 * fc
+  s45 <- 0.45 * fc
+
+  # Para interpolar ε(s), necesitamos σ creciente (aprox.) en la rama ascendente.
+  # Usamos cummax para imponer monotonía y luego quitar duplicados.
+  df_up2 <- df_up %>%
+    dplyr::mutate(stress_mono = cummax(stress_mpa)) %>%
+    dplyr::select(strain, stress_mono) %>%
+    dplyr::distinct(stress_mono, .keep_all = TRUE) %>%
+    dplyr::arrange(stress_mono)
+
+  # Si aún no hay suficiente rango para interpolar:
+  if(nrow(df_up2) < 2 || max(df_up2$stress_mono, na.rm=TRUE) < s45){
+    return(tibble(
+      fc_mpa = fc,
+      strain_at_fc = eps_fc,
+      toughness_to_fc = tough,
+      strain_5 = NA_real_,
+      strain_45 = NA_real_,
+      Es_MPa = NA_real_
+    ))
+  }
+
+  e5  <- approx(x = df_up2$stress_mono, y = df_up2$strain, xout = s5,  rule = 2)$y
+  e45 <- approx(x = df_up2$stress_mono, y = df_up2$strain, xout = s45, rule = 2)$y
+
+  Es <- (s45 - s5) / (e45 - e5)
+
+  tibble(
+    fc_mpa = fc,
+    strain_at_fc = eps_fc,
+    toughness_to_fc = tough,
+    strain_5 = e5,
+    strain_45 = e45,
+    Es_MPa = Es
+  )
+}
+
+metrics <- curves %>%
+  dplyr::group_by(sheet, specimen) %>%
+  dplyr::group_modify(~ calc_metrics_one(.x)) %>%
+  dplyr::ungroup()
+
+metrics %>% arrange(sheet, desc(fc_mpa)) %>% head(10)
+```
+
+## 6.1. Estadística descriptiva 
+
+La estadística descriptiva resume los parámetros mecánicos obtenidos a partir de las curvas esfuerzo–deformación para cada grupo de especímenes. Los valores promedio de resistencia a la compresión se sitúan en un rango entre 12.3 y 13.4 MPa, mostrando diferencias relativamente pequeñas entre los grupos analizados. No obstante, la desviación estándar elevada observada en algunos casos evidencia una dispersión considerable en los resultados experimentales, lo que puede asociarse a la variabilidad inherente del material y a las condiciones de ensayo. Asimismo, los valores de tenacidad presentan diferencias moderadas entre grupos, reflejando variaciones en la capacidad de disipación de energía del material durante el proceso de carga.
+
+
+```{r summary-by-group}
+summary_group <- metrics %>%
+  group_by(sheet) %>%
+  summarise(
+    n = n(),
+    fc_mean = mean(fc_mpa, na.rm=TRUE),
+    fc_sd   = sd(fc_mpa, na.rm=TRUE),
+    Es_mean = mean(Es_MPa, na.rm=TRUE),
+    Es_sd   = sd(Es_MPa, na.rm=TRUE),
+    toughness_mean = mean(toughness_to_fc, na.rm=TRUE),
+    toughness_sd   = sd(toughness_to_fc, na.rm=TRUE),
+    .groups = "drop"
+  )
+
+summary_group
+```
+
+## 6.2. Comparación: $f'_c$ y módulo secante
+
+La comparación de los parámetros mecánicos muestra que la resistencia a la compresión presenta valores relativamente similares entre los grupos analizados, aunque los grupos CRF-B y CRF-R-B tienden a alcanzar valores máximos ligeramente superiores. En contraste, el módulo secante muestra una mayor dispersión entre especímenes, evidenciando variabilidad en la rigidez inicial del material. Estos resultados sugieren que, aunque la resistencia máxima es comparable entre configuraciones, la rigidez y la respuesta deformacional del concreto presentan diferencias más marcadas entre grupos.
+
+```{r boxplots}
+p_fc <- ggplot(metrics, aes(x = sheet, y = fc_mpa)) +
+  geom_boxplot() +
+  geom_jitter(width = 0.15, alpha = 0.7) +
+  labs(title = "Resistencia a compresión $f'_c$",
+       x = "Grupo (hoja)", y = "MPa") +
+  theme_minimal()
+
+p_Es <- ggplot(metrics, aes(x = sheet, y = Es_MPa)) +
+  geom_boxplot() +
+  geom_jitter(width = 0.15, alpha = 0.7) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(title = "Módulo secante (5%–45% de $f'_c$)",
+       x = "Grupo (hoja)", y = "MPa") +
+  theme_minimal()
+
+p_fc / p_Es
+```
+
+## 6.3. Correlación: Módulo secante - Resistencia a la compresión
+
+El análisis de correlación muestra que la relación entre el módulo secante y la resistencia a la compresión, presenta tendencias diferentes entre los grupos evaluados. En los grupos CRF-B y CRF-R-B se observa una tendencia positiva, lo que indica que mayores valores de rigidez se asocian con mayores resistencias a compresión. En contraste, los grupos C-B y C-R-B presentan una relación menos clara y con mayor dispersión de los datos. Asimismo, la relación entre la deformación al pico y la resistencia muestra una tendencia ligeramente negativa, sugiriendo que especímenes con mayor resistencia tienden a alcanzar el esfuerzo máximo a menores deformaciones. Estos resultados evidencian diferencias en el comportamiento mecánico entre configuraciones y reflejan la variabilidad inherente del material.
+
+```{r correlations}
+p_corr1 <- ggplot(metrics, aes(x = Es_MPa, y = fc_mpa, label = specimen)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = TRUE) +
+  facet_wrap(~sheet, scales = "free") +
+  labs(title = "Relación entre módulo secante y resistencia a compresión",
+       x = "Es (MPa)", y = "f'c (MPa)") +
+  theme_minimal()
+
+p_corr2 <- ggplot(metrics, aes(x = strain_at_fc, y = fc_mpa)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = TRUE) +
+  facet_wrap(~sheet, scales = "free") +
+  labs(title = "Relación entre deformación en el pico y resistencia a compresión",
+       x = "Deformación al pico", y = "f'c (MPa)") +
+  theme_minimal()
+
+p_corr1 / p_corr2
+```
+
+
+# 7. Análisis estadístico
+
+El análisis estadístico constituye una herramienta fundamental para la interpretación de datos experimentales obtenidos en ensayos de compresión de cilindros de concreto. A partir del registro de variables como el esfuerzo aplicado y la deformación medida durante el proceso de carga, es posible caracterizar el comportamiento mecánico del material y evaluar su respuesta estructural bajo condiciones controladas de laboratorio.
+
+En este contexto, el análisis estadístico permite identificar tendencias, variabilidad y relaciones entre las variables medidas, facilitando la comprensión de la evolución del esfuerzo en función de la deformación. Asimismo, mediante el uso de estadísticos descriptivos, visualización de datos y técnicas de análisis exploratorio, es posible detectar patrones de comportamiento, valores atípicos y posibles inconsistencias en los registros experimentales.
+
+El uso de herramientas de analítica de datos implementadas en el entorno de programación R permite automatizar el procesamiento de la información, generar representaciones gráficas de las curvas esfuerzo–deformación y extraer parámetros relevantes que describen el comportamiento del concreto durante el ensayo. De esta manera, el análisis estadístico no solo contribuye a una mejor interpretación de los resultados experimentales, sino que también fortalece la confiabilidad del proceso de evaluación del material.
+
+En esta sección se aplica, por cada métrica:
+
+1. **Normalidad por grupo**: Shapiro–Wilk.
+2. **Homogeneidad de varianzas**: Levene.
+3. Selección automática del test global:
+   - Si (aprox.) normalidad y varianzas homogéneas: **ANOVA** + **Tukey HSD**.
+   - Si normalidad pero varianzas no homogéneas: **ANOVA de Welch** + **Games–Howell**.
+   - Si no hay normalidad: **Kruskal–Wallis** + **Dunn (BH)**.
+
+
+```{r stats-formal-helpers}
+# Helper para decidir pruebas y ejecutar post-hoc (robusto a NA/Inf y grupos pequeños)
+formal_compare <- function(df, response, group = "sheet", alpha = 0.05){
+
+  resp <- rlang::ensym(response)
+  grp  <- rlang::ensym(group)
+
+  grp_name  <- rlang::as_name(grp)
+  resp_name <- rlang::as_name(resp)
+
+  dat <- df %>%
+    dplyr::select(!!grp, !!resp) %>%
+    dplyr::mutate(
+      !!grp := as.factor(!!grp),
+      value = as.numeric(!!resp)
+    ) %>%
+    dplyr::filter(is.finite(value)) %>%
+    dplyr::select(!!grp, value)
+
+  # Requerimientos mínimos: al menos 2 grupos y al menos 2 observaciones por grupo
+  counts <- dat %>% dplyr::count(!!grp, name = "n")
+  dat_ok <- counts %>% dplyr::filter(n >= 2)
+  dat <- dat %>% dplyr::semi_join(dat_ok, by = grp_name)
+
+  if(dplyr::n_distinct(dat[[grp_name]]) < 2){
+    return(list(
+      test = "Insuficiente",
+      decision = list(reason = "Se requieren ≥2 grupos con ≥2 valores finitos cada uno."),
+      shapiro = NULL,
+      levene = NULL,
+      global = NULL,
+      effect = NULL,
+      posthoc = NULL
+    ))
+  }
+
+  # 1) Normalidad por grupo (Shapiro)
+  sh <- dat %>%
+    dplyr::group_by(.data[[grp_name]]) %>%
+    rstatix::shapiro_test(value) %>%
+    dplyr::ungroup()
+
+  normal_ok <- all(sh$p > alpha)
+
+  # 2) Homogeneidad (Levene) — construir fórmula base R (evita .data en model.frame)
+  lev_form <- stats::as.formula(paste0("value ~ `", grp_name, "`"))
+  lev <- car::leveneTest(lev_form, data = dat)
+  lev_p <- lev$`Pr(>F)`[1]
+  var_ok <- is.finite(lev_p) && (lev_p > alpha)
+
+  out <- list(
+    shapiro = sh,
+    levene  = lev,
+    decision = list(normal_ok = normal_ok, var_ok = var_ok)
+  )
+
+  if(normal_ok && var_ok){
+    # ANOVA clásico
+    aov_form <- stats::as.formula(paste0("value ~ `", grp_name, "`"))
+    fit <- stats::aov(aov_form, data = dat)
+    an  <- broom::tidy(fit)
+    eff <- rstatix::eta_squared(fit)
+    post <- rstatix::tukey_hsd(dat, formula = aov_form)
+    out$test <- "ANOVA"
+    out$global <- an
+    out$effect <- eff
+    out$posthoc <- post
+
+  } else if(normal_ok && !var_ok){
+    # Welch ANOVA + Games-Howell
+    wel_form <- stats::as.formula(paste0("value ~ `", grp_name, "`"))
+    wel <- rstatix::welch_anova_test(dat, formula = wel_form)
+    eff <- rstatix::omega_squared(dat, formula = wel_form)
+    post <- rstatix::games_howell_test(dat, formula = wel_form)
+    out$test <- "Welch ANOVA"
+    out$global <- wel
+    out$effect <- eff
+    out$posthoc <- post
+
+  } else {
+    # Kruskal + Dunn BH
+    kr_form <- stats::as.formula(paste0("value ~ `", grp_name, "`"))
+    kr <- rstatix::kruskal_test(dat, formula = kr_form)
+    eff <- rstatix::kruskal_effsize(dat, formula = kr_form)
+    post <- rstatix::dunn_test(dat, formula = kr_form, p.adjust.method = "BH")
+    out$test <- "Kruskal–Wallis"
+    out$global <- kr
+    out$effect <- eff
+    out$posthoc <- post
+  }
+
+  out
+}
+```
+
+## 7.1. Análisis del parámetro: resistencia a la compresión $f'_c$
+
+El análisis estadístico del parámetro resistencia a la compresión $f'_c$ se realizó evaluando previamente los supuestos de normalidad y homogeneidad de varianzas. Los resultados indicaron que la normalidad no se cumple (normal_ok=FALSE), mientras que la homogeneidad de varianzas sí se verifica, lo cual fue confirmado mediante la prueba de Levene (p=0.9874>0.05). 
+Debido a la ausencia de normalidad en los datos, se empleó la prueba no paramétrica de Kruskal–Wallis para analizar posibles diferencias entre grupos. Los valores obtenidos de p < 0.05 en todos los casos sugieren la existencia de diferencias estadísticamente significativas en la resistencia a la compresión entre los grupos analizados, evidenciando que la configuración del material influye en el comportamiento mecánico del sistema.
+
+```{r stats-fc}
+res_fc <- formal_compare(metrics, response = fc_mpa, group = sheet)
+
+res_fc$test
+res_fc$decision
+res_fc$shapiro
+res_fc$levene
+res_fc$global
+res_fc$effect
+res_fc$posthoc %>% arrange(p.adj)
+```
+
+Adicionalmente, el análisis global mediante la prueba de Kruskal–Wallis no evidenció diferencias estadísticamente significativas entre los grupos (H=0.447, p=0.93). El tamaño del efecto calculado mediante eta cuadrado de Kruskal–Wallis (ηH2=−0.091) indica un efecto moderado, sugiriendo que las variaciones observadas entre grupos no son suficientemente marcadas desde el punto de vista estadístico. Asimismo, las comparaciones post hoc entre pares de grupos muestran valores de padj > 0.05 en todos los casos, lo que confirma que no existen diferencias significativas entre las configuraciones evaluadas en términos de resistencia a la compresión. 
+
+Estos resultados sugieren que el comportamiento resistente es comparable entre los grupos analizados bajo las condiciones experimentales consideradas.
+
+## 7.2. Análisis del parámetro: módulo secante $E_s$
+
+El análisis del módulo secante $E_S$ se realizó verificando previamente los supuestos estadísticos. Los resultados indican que la normalidad no se cumple (normal_ok=FALSE), mientras que la homogeneidad de varianzas sí se satisface, según la prueba de Levene (p=0.3502>0.05). Por esta razón se empleó la prueba no paramétrica de Kruskal–Wallis, la cual mostró que no existen diferencias estadísticamente significativas entre los grupos analizados (H=2.78,p=0.426). El tamaño del efecto obtenido (ηH2≈−0.009) corresponde a un efecto pequeño, indicando una baja influencia del tipo de configuración sobre el módulo secante. De manera consistente, las comparaciones post hoc entre pares de grupos presentaron valores de 
+padj>0.05, confirmando que no se identifican diferencias significativas en la rigidez entre las configuraciones evaluadas.
+
+```{r stats-es}
+res_es <- formal_compare(metrics, response = Es_MPa, group = sheet)
+
+res_es$test
+res_es$decision
+res_es$shapiro
+res_es$levene
+res_es$global
+res_es$effect
+res_es$posthoc %>% arrange(p.adj)
+```
+
+## 7.3. Análisis del parámetro: tenacidad 
+
+El análisis del parámetro tenacidad se realizó verificando previamente los supuestos estadísticos, observándose que se cumple la normalidad de los datos y la homogeneidad de varianzas, confirmada mediante la prueba de Levene (p=0.9552>0.05). En consecuencia, se aplicó un análisis de varianza (ANOVA) para evaluar diferencias entre los grupos. Los resultados del ANOVA indican que no existen diferencias estadísticamente significativas en la tenacidad entre las configuraciones evaluadas (F=0.203,p=0.893). Asimismo, las comparaciones post hoc entre pares de grupos presentan valores de padj>0.05 en todos los casos, lo que confirma que ninguna de las configuraciones muestra diferencias significativas en términos de capacidad de absorción de energía bajo las condiciones experimentales consideradas.
+
+```{r stats-toughness}
+res_t <- formal_compare(metrics, response = toughness_to_fc, group = sheet)
+
+res_t$test
+res_t$decision
+res_t$shapiro
+res_t$levene
+res_t$global
+res_t$effect
+res_t$posthoc %>% arrange(p.adj)
+```
+
+## 7.4. Resumen (p-valores)
+
+El resumen de los valores p obtenidos para los parámetros evaluados indica que no se identifican diferencias estadísticamente significativas entre los grupos analizados. En el caso de la resistencia a la compresión $f'_c$ y el módulo secante $E_S$, evaluados mediante la prueba de Kruskal–Wallis, se obtuvieron valores de p=0.93 y p=0.426, respectivamente. De igual manera, el análisis de tenacidad, evaluado mediante ANOVA, presentó un valor de p=0.893. Dado que en todos los casos p>0.05, no existe evidencia estadística suficiente para afirmar diferencias globales entre las configuraciones estudiadas, lo que sugiere un comportamiento comparable entre los grupos bajo las condiciones experimentales evaluadas.
+
+```{r stats-summary-table}
+global_pvals <- tibble::tibble(
+  metrica = c("f'c (MPa)", "Es (MPa)", "Toughness (área hasta pico)"),
+  test = c(res_fc$test, res_es$test, res_t$test),
+  p_value = c(
+    dplyr::coalesce(res_fc$global$p.value[1], res_fc$global$p[1]),
+    dplyr::coalesce(res_es$global$p.value[1], res_es$global$p[1]),
+    dplyr::coalesce(res_t$global$p.value[1], res_t$global$p[1])
+  )
+)
+
+global_pvals
+```
+
+
+# 8. Conclusiones
+
+El presente estudio permitió evaluar el comportamiento mecánico de las configuraciones analizadas mediante el análisis de las curvas esfuerzo–deformación, así como de parámetros clave como la resistencia a compresión $f'_c$, el módulo secante $E_s$ y la tenacidad. Con base en los resultados experimentales y el análisis estadístico realizado, se establecen las siguientes conclusiones principales:
+
+1. Las curvas esfuerzo–deformación muestran un comportamiento mecánico consistente entre las configuraciones evaluadas, caracterizado por un incremento rápido del esfuerzo hasta alcanzar el pico resistente, seguido de una fase de degradación progresiva. Este comportamiento refleja la respuesta típica del material bajo compresión y evidencia una variabilidad moderada entre especímenes.
+
+2. Los resultados estadísticos indican que no existen diferencias significativas entre los grupos analizados en términos de resistencia a compresión $f'_c$, módulo secante $E_s$ y tenacidad (p>0.05 en todos los casos). Esto sugiere que las variaciones en la configuración del sistema no generan cambios estadísticamente relevantes en la capacidad resistente, la rigidez ni en la capacidad de disipación de energía bajo las condiciones experimentales consideradas.
+
+3. El análisis de correlación evidencia que la relación entre el módulo secante y la resistencia a compresión presenta tendencias diferenciadas entre configuraciones, mientras que la deformación correspondiente al pico de esfuerzo tiende a disminuir a medida que aumenta la resistencia. No obstante, la dispersión observada sugiere que el comportamiento mecánico del sistema está influenciado por factores asociados a la heterogeneidad del material y a las condiciones de ensayo.
+
+4. En conjunto, los resultados obtenidos aportan evidencia experimental relevante para la caracterización del comportamiento mecánico del material estudiado, demostrando que las configuraciones evaluadas presentan un desempeño estructural comparable. Estos hallazgos contribuyen al entendimiento del comportamiento del sistema bajo solicitaciones de compresión y constituyen una base para futuras investigaciones orientadas a optimizar su desempeño estructural y su aplicación en sistemas constructivos.
+
